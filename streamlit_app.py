@@ -5,27 +5,56 @@ import asyncio
 import aiohttp
 import time
 
-# 設定頁面
-st.set_page_config(page_title="Ultra Image Checker", layout="wide", page_icon="⚡")
-st.title("⚡ 極速圖片網址檢查工具 (AsyncIO 版)")
+# 設定頁面資訊
+st.set_page_config(page_title="HTTP Status Checker", layout="wide", page_icon="📡")
+
+st.title("📡 圖片 HTTP 狀態碼檢查工具")
+st.markdown("""
+此工具專注於檢查圖片網址的 **HTTP 回傳狀態 (Status Code)**，並將錯誤分開統計：
+* **200**: 🟢 正常 (OK)
+* **404**: 🔴 找不到檔案 (Not Found)
+* **410**: 🏚️ 資源已移除 (Gone - 永久刪除)
+* **403**: 🟠 禁止存取 (Forbidden)
+* **5xx**: ⚠️ 伺服器錯誤
+""")
 
 # --- 非同步檢查核心邏輯 ---
-async def check_url_async(session, url):
-    """非同步檢查單一網址"""
+async def check_http_status(session, url):
+    """非同步檢查 HTTP Status Code"""
     if not url or not isinstance(url, str) or not url.startswith('http'):
-        return {"url": url, "status": "⚠️ Invalid URL", "size_kb": 0, "error": "Malformed URL"}
+        return {"url": url, "code": 0, "status": "⚠️ Invalid URL", "reason": "Malformed URL"}
     
     try:
-        # 使用 HEAD 請求，timeout 設定為 5 秒
+        # 使用 HEAD 請求
         async with session.head(url, timeout=5, allow_redirects=True) as response:
-            if response.status == 200:
-                size_bytes = int(response.headers.get('Content-Length', 0))
-                size_kb = round(size_bytes / 1024, 2)
-                return {"url": url, "status": "✅ OK", "size_kb": size_kb, "error": ""}
+            code = response.status
+            reason = response.reason
+            
+            # 狀態碼分類字串
+            if code == 200:
+                status_icon = "🟢 200 OK"
+            elif code == 404:
+                status_icon = "🔴 404 Not Found"
+            elif code == 410:
+                status_icon = "🏚️ 410 Gone"
+            elif code == 403:
+                status_icon = "🟠 403 Forbidden"
+            elif code >= 500:
+                status_icon = f"🔥 {code} Server Error"
             else:
-                return {"url": url, "status": f"❌ Error {response.status}", "size_kb": 0, "error": f"HTTP {response.status}"}
+                status_icon = f"⚪ {code} {reason}"
+
+            return {
+                "url": url, 
+                "code": code, 
+                "status": status_icon, 
+                "reason": reason
+            }
+            
+    except asyncio.TimeoutError:
+        return {"url": url, "code": 408, "status": "⏱️ Timeout", "reason": "Connection timed out"}
     except Exception as e:
-        return {"url": url, "status": "⚠️ Failed", "size_kb": 0, "error": str(e)}
+        return {"url": url, "code": 0, "status": "❌ Error", "reason": str(e)}
 
 async def process_batch(urls, max_concurrency, progress_bar, status_text):
     """控制併發數量並更新進度"""
@@ -33,21 +62,19 @@ async def process_batch(urls, max_concurrency, progress_bar, status_text):
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = []
         for url in urls:
-            task = check_url_async(session, url)
+            task = check_http_status(session, url)
             tasks.append(task)
         
         results = []
         total = len(urls)
         
-        # 使用 as_completed 讓完成的任務立即回傳，以更新進度條
         for i, future in enumerate(asyncio.as_completed(tasks)):
             result = await future
             results.append(result)
             
-            # 更新進度
             percent = (i + 1) / total
             progress_bar.progress(percent)
-            status_text.text(f"🚀 正在檢查: {i + 1} / {total} ({(percent * 100):.1f}%)")
+            status_text.text(f"📡 掃描中: {i + 1} / {total} ({(percent * 100):.1f}%)")
             
         return results
 
@@ -59,66 +86,88 @@ def extract_url(json_str):
         return None
 
 # --- UI 介面 ---
-tab1, tab2 = st.tabs(["⚡ 批量極速檢查", "🔍 單一網址檢查"])
+tab1, tab2 = st.tabs(["📂 批量 CSV 檢查", "🔍 單一網址測試"])
 
 # === Tab 1: 批量檢查 ===
 with tab1:
-    st.header("上傳 CSV 進行大量掃描")
+    st.header("上傳 CSV 檢查 HTTP 狀態")
     
-    # 側邊欄設定
-    with st.expander("⚙️ 進階設定 (速度控制)", expanded=True):
-        concurrency = st.slider(
-            "同時併發連線數 (Batch Size)", 
-            min_value=10, 
-            max_value=200, 
-            value=50, 
-            help="數值越高越快，但可能導致伺服器阻擋。建議設定 50-100。"
-        )
+    with st.expander("⚙️ 設定併發數 (速度控制)", expanded=False):
+        concurrency = st.slider("同時連線數", 10, 200, 50)
     
-    uploaded_file = st.file_uploader("選擇您的 CSV 檔案", type=["csv"], key="batch_async")
+    uploaded_file = st.file_uploader("選擇您的 CSV 檔案", type=["csv"], key="http_check_uploader")
 
     if uploaded_file is not None:
         try:
             df = pd.read_csv(uploaded_file)
             if 'mainImage' in df.columns:
-                df['extracted_url'] = df['mainImage'].apply(extract_url)
-                unique_urls = df['extracted_url'].dropna().unique().tolist()
+                with st.spinner("正在解析 JSON 網址..."):
+                    df['extracted_url'] = df['mainImage'].apply(extract_url)
+                    unique_urls = df['extracted_url'].dropna().unique().tolist()
                 
-                st.info(f"📊 檔案讀取成功！準備檢查 {len(unique_urls)} 個網址。")
+                st.info(f"📊 準備檢查 {len(unique_urls)} 個網址。")
 
-                if st.button("🚀 開始極速掃描"):
-                    # 初始化 UI 元件
+                if st.button("🚀 開始 HTTP 檢查"):
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     start_time = time.time()
 
-                    # 執行 AsyncIO
                     results = asyncio.run(process_batch(unique_urls, concurrency, progress_bar, status_text))
                     
-                    end_time = time.time()
-                    duration = end_time - start_time
-                    
-                    # 顯示完成訊息
+                    duration = time.time() - start_time
                     progress_bar.progress(1.0)
-                    status_text.text(f"✅ 檢查完成！")
-                    st.success(f"🎉 全部完成！耗時: {duration:.2f} 秒 (平均每秒 {len(unique_urls)/duration:.1f} 張)")
+                    status_text.text(f"✅ 完成！")
+                    st.success(f"🎉 檢查完畢！耗時: {duration:.2f} 秒")
 
-                    # 統計與顯示
                     results_df = pd.DataFrame(results)
                     
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("✅ 正常", len(results_df[results_df['status'] == "✅ OK"]))
-                    c2.metric("❌ 異常", len(results_df[results_df['status'] != "✅ OK"]))
-                    c3.metric("⚠️ 失敗", len(results_df[results_df['status'] == "⚠️ Failed"]))
-
-                    st.dataframe(results_df, use_container_width=True)
+                    # --- 統計看板 (獨立顯示) ---
+                    st.markdown("### 📊 狀態統計")
+                    c1, c2, c3, c4, c5 = st.columns(5)
                     
-                    # 下載
+                    c1.metric("🟢 200 正常", len(results_df[results_df['code'] == 200]))
+                    
+                    # 重點：404 和 410 分開
+                    c2.metric("🔴 404 Not Found", len(results_df[results_df['code'] == 404]))
+                    c3.metric("🏚️ 410 Gone", len(results_df[results_df['code'] == 410]))
+                    
+                    c4.metric("🟠 403 Forbidden", len(results_df[results_df['code'] == 403]))
+                    
+                    # 統計 5xx 或其他錯誤 (Timeout / Connect Error)
+                    other_errors = len(results_df[~results_df['code'].isin([200, 404, 410, 403])])
+                    c5.metric("⚠️ 其他/5xx", other_errors)
+
+                    st.divider()
+
+                    # --- 詳細結果 ---
+                    st.subheader("詳細清單")
+                    
+                    # 預設不過濾，顯示所有
+                    all_statuses = sorted(results_df['status'].unique())
+                    filter_option = st.multiselect(
+                        "過濾狀態碼:", 
+                        options=all_statuses,
+                        default=all_statuses
+                    )
+                    
+                    filtered_df = results_df[results_df['status'].isin(filter_option)]
+                    
+                    st.dataframe(
+                        filtered_df, 
+                        column_config={
+                            "url": st.column_config.LinkColumn("圖片網址"),
+                            "status": "狀態",
+                            "code": "代碼",
+                            "reason": "伺服器訊息"
+                        },
+                        use_container_width=True
+                    )
+                    
                     csv = results_df.to_csv(index=False).encode('utf-8')
                     st.download_button(
-                        "📥 下載完整報告",
+                        "📥 下載完整 HTTP 報告",
                         data=csv,
-                        file_name="async_image_report.csv",
+                        file_name="http_status_report.csv",
                         mime="text/csv"
                     )
             else:
@@ -126,19 +175,28 @@ with tab1:
         except Exception as e:
             st.error(f"錯誤: {e}")
 
-# === Tab 2: 單一檢查 (保持不變) ===
+# === Tab 2: 單一檢查 ===
 with tab2:
-    st.header("單一網址快速測試")
-    url_input = st.text_input("輸入圖片網址")
-    if st.button("檢查"):
+    st.header("單一網址 HTTP 測試")
+    url_input = st.text_input("輸入圖片網址", placeholder="https://...")
+    
+    if st.button("檢查狀態"):
         if url_input:
             async def run_single():
                 async with aiohttp.ClientSession() as session:
-                    return await check_url_async(session, url_input)
+                    return await check_http_status(session, url_input)
             
             res = asyncio.run(run_single())
-            if res['status'] == "✅ OK":
-                st.success(f"狀態: {res['status']} | 大小: {res['size_kb']} KB")
-                st.image(url_input, width=300)
+            
+            # 單一檢查的顯示邏輯
+            if res['code'] == 200:
+                st.success(f"狀態: {res['status']}")
+                st.image(url_input, width=300, caption="圖片預覽")
+            elif res['code'] == 404:
+                st.error(f"狀態: {res['status']}")
+                st.warning("❌ 找不到檔案 (URL 路徑錯誤或檔案不存在)。")
+            elif res['code'] == 410:
+                st.error(f"狀態: {res['status']}")
+                st.warning("🏚️ 檔案已被永久移除 (Gone)，不會再回來。")
             else:
-                st.error(f"狀態: {res['status']} | 錯誤: {res['error']}")
+                st.warning(f"狀態: {res['status']} | 訊息: {res['reason']}")
