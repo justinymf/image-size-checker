@@ -43,15 +43,65 @@ with tab1:
     uploaded_file = st.file_uploader("選擇您的 CSV 檔案", type=["csv"], key="batch_uploader")
 
     if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        if 'mainImage' in df.columns:
-            df['extracted_url'] = df['mainImage'].apply(extract_url)
-            unique_urls = df['extracted_url'].dropna().unique().tolist()
-            st.write(f"📊 偵測到 {len(unique_urls)} 個唯一網址。")
+        try:
+            df = pd.read_csv(uploaded_file)
+            if 'mainImage' in df.columns:
+                df['extracted_url'] = df['mainImage'].apply(extract_url)
+                unique_urls = df['extracted_url'].dropna().unique().tolist()
+                st.write(f"📊 偵測到 {len(unique_urls)} 個唯一網址。")
 
-            if st.button("🚀 開始批次掃描"):
-                results = []
-                progress_bar = st.progress(0)
+                if st.button("🚀 開始批次掃描"):
+                    results = []
+                    progress_bar = st.progress(0)
+                    
+                    # 這裡就是修正後的關鍵部分
+                    with ThreadPoolExecutor(max_workers=10) as executor:
+                        future_to_url = {executor.submit(check_image_size, url): url for url in unique_urls}
+                        for i, future in enumerate(future_to_url):
+                            results.append(future.result())
+                            progress_bar.progress((i + 1) / len(unique_urls))
+
+                    results_df = pd.DataFrame(results)
+                    st.dataframe(results_df, use_container_width=True)
+                    
+                    # 下載按鈕
+                    csv = results_df.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="📥 下載報告",
+                        data=csv,
+                        file_name="report.csv",
+                        mime="text/csv"
+                    )
+            else:
+                st.error("CSV 缺少 'mainImage' 欄位！")
+        except Exception as e:
+            st.error(f"讀取檔案時發生錯誤: {e}")
+
+# --- Tab 2: 單一檢查 ---
+with tab2:
+    st.header("輸入單個圖片網址")
+    st.markdown("您可以直接貼上圖片連結來檢查該圖片是否在線上以及它的檔案大小。")
+    
+    # 輸入框
+    input_url = st.text_input("圖片 URL", placeholder="https://contents.mediadecathlon.com/...")
+
+    if st.button("🔍 立即檢查"):
+        if input_url:
+            with st.spinner('正在連線檢查中...'):
+                res = check_image_size(input_url)
                 
-                with ThreadPoolExecutor(max_workers=10) as executor:
-                    future_to_url = {executor.submit(check_image_size,
+                # 顯示結果卡片
+                if res['status'] == "✅ OK":
+                    st.success(f"狀態：{res['status']}")
+                    c1, c2 = st.columns(2)
+                    c1.metric("檔案大小", f"{res['size_kb']} KB")
+                    # 嘗試顯示圖片
+                    try:
+                        c2.image(input_url, caption="圖片預覽", width=300)
+                    except:
+                        c2.warning("無法載入預覽圖")
+                else:
+                    st.error(f"狀態：{res['status']}")
+                    st.warning(f"詳細錯誤：{res['error']}")
+        else:
+            st.info("請先輸入網址。")
