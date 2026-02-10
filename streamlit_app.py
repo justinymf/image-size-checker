@@ -1,249 +1,182 @@
-import streamlit as st
-import pandas as pd
-import json
-import asyncio
-import aiohttp
-import time
-import random
+// ==========================================
+// ⚙️ 設定區 (請依照你的表格修改)
+// ==========================================
+var SHEET_NAME = '工作表1'; // 你的工作表名稱 (Tab Name)
+var URL_COL = 2;           // 你的 "url" 在第幾欄 (B欄 = 2)
+var STATUS_COL = 3;        // 你的 "Image status" 在第幾欄 (C欄 = 3)
+var START_ROW = 2;         // 從第幾行開始 (避開標題列)
+var MAX_EXECUTION_TIME = 280; // 執行時間限制 (秒)
 
-# 設定頁面資訊
-st.set_page_config(page_title="HTTP Status Checker Pro", layout="wide", page_icon="🛡️")
+// ==========================================
+// 1️⃣ 選單與主功能
+// ==========================================
 
-st.title("🛡️ 圖片 HTTP 狀態檢查工具 (即時 410 監控版)")
-st.markdown("""
-此版本包含 **410 即時監控功能**：
-* 當系統偵測到 **410 Gone** 時，會立刻在下方顯示該連結。
-* 系統會嘗試顯示該圖片（因為已移除，您應該會看到「破圖」圖示）。
-""")
-
-# --- 偽裝 Header ---
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+/**
+ * 建立 Google Sheet 選單
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('圖片檢查工具 🚀')
+    .addItem('▶️ 開始檢查 (直接讀取 URL)', 'startRowByRowScanning')
+    .addItem('🔄 重置進度', 'resetProgress')
+    .addItem('🛑 停止所有排程', 'stopTrigger')
+    .addToUi();
 }
 
-# --- 非同步檢查核心邏輯 (含重試機制) ---
-async def check_http_status(session, url, semaphore):
-    """非同步檢查 HTTP Status Code，包含重試邏輯"""
-    if not url or not isinstance(url, str) or not url.startswith('http'):
-        return {"url": url, "code": 0, "status": "⚠️ Invalid URL", "reason": "Malformed URL"}
+/**
+ * 重置進度
+ */
+function resetProgress() {
+  var props = PropertiesService.getScriptProperties();
+  props.deleteProperty('LAST_ROW');
+  stopTrigger();
+  SpreadsheetApp.getActiveSpreadsheet().toast('已重置！請點擊「開始」從頭掃描。', '重置完成');
+}
+
+/**
+ * 停止排程
+ */
+function stopTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    ScriptApp.deleteTrigger(triggers[i]);
+  }
+  SpreadsheetApp.getActiveSpreadsheet().toast('自動排程已停止。');
+}
+
+// ==========================================
+// 2️⃣ 核心掃描邏輯
+// ==========================================
+
+/**
+ * 主程式：逐行讀取 Column B 的 URL 並檢查
+ */
+function startRowByRowScanning() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert('❌ 找不到工作表: "' + SHEET_NAME + '"，請修改程式碼第 4 行。');
+    return;
+  }
+
+  // 讀取上次進度
+  var props = PropertiesService.getScriptProperties();
+  var currentRow = parseInt(props.getProperty('LAST_ROW')) || START_ROW;
+  var lastRow = sheet.getLastRow();
+
+  // 檢查是否完成
+  if (currentRow > lastRow) {
+    SpreadsheetApp.getUi().alert('✅ 所有網址檢查完畢！');
+    stopTrigger();
+    props.deleteProperty('LAST_ROW');
+    return;
+  }
+
+  // 顯示提示
+  if (currentRow === START_ROW) {
+    SpreadsheetApp.getActiveSpreadsheet().toast('🚀 正在讀取 Column ' + URL_COL + ' 的網址進行檢查...', '開始');
+  }
+
+  var startTime = (new Date()).getTime();
+
+  // --- 逐行迴圈 ---
+  for (var i = currentRow; i <= lastRow; i++) {
     
-    # 限制同時執行數量
-    async with semaphore:
-        retries = 3
-        for attempt in range(retries):
-            try:
-                # 使用 HEAD 請求
-                async with session.head(url, headers=HEADERS, timeout=10, allow_redirects=True) as response:
-                    code = response.status
-                    reason = response.reason
-                    
-                    if code in [504, 429, 503] and attempt < retries - 1:
-                        wait_time = (attempt + 1) * 2
-                        await asyncio.sleep(wait_time)
-                        continue 
+    // ⏰ 時間監控 (4分40秒自動暫停)
+    var currentTime = (new Date()).getTime();
+    if ((currentTime - startTime) / 1000 > MAX_EXECUTION_TIME) {
+      props.setProperty('LAST_ROW', i);
+      createTrigger(); // 設定 1 分鐘後自動重啟
+      SpreadsheetApp.getActiveSpreadsheet().toast('⏳ 休息 1 分鐘後自動繼續... (目前進度: Row ' + i + ')');
+      return;
+    }
 
-                    # 狀態碼分類
-                    if code == 200:
-                        status_icon = "🟢 200 OK"
-                    elif code == 404:
-                        status_icon = "🔴 404 Not Found"
-                    elif code == 410:
-                        status_icon = "🏚️ 410 Gone"
-                    elif code == 403:
-                        status_icon = "🟠 403 Forbidden"
-                    elif code >= 500:
-                        status_icon = f"🔥 {code} Server Error"
-                    else:
-                        status_icon = f"⚪ {code} {reason}"
-
-                    return {
-                        "url": url, 
-                        "code": code, 
-                        "status": status_icon, 
-                        "reason": reason
-                    }
-            
-            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-                if attempt < retries - 1:
-                    await asyncio.sleep(2)
-                    continue
-                return {"url": url, "code": 0, "status": "❌ Connection Error", "reason": str(e)}
-            except Exception as e:
-                return {"url": url, "code": 0, "status": "❌ Error", "reason": str(e)}
-
-async def process_batch_smart(urls, max_concurrency, progress_bar, status_text, error_container, show_broken_img):
-    """智能分批處理，並即時回報 410"""
+    // 1. 直接讀取儲存格
+    var urlCell = sheet.getRange(i, URL_COL);     // 讀取 "url" (Column 2)
+    var statusCell = sheet.getRange(i, STATUS_COL); // 準備寫入 "Image status" (Column 3)
     
-    semaphore = asyncio.Semaphore(max_concurrency)
-    connector = aiohttp.TCPConnector(limit=max_concurrency, ssl=False)
-    timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=10)
+    var url = urlCell.getValue();
+    var currentStatus = statusCell.getValue();
 
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        results = []
-        total = len(urls)
-        chunk_size = 50 
-        
-        # 用來計算即時錯誤數量
-        error_count_410 = 0
-        
-        for i in range(0, total, chunk_size):
-            chunk_urls = urls[i : i + chunk_size]
-            chunk_tasks = []
-            
-            for url in chunk_urls:
-                task = check_http_status(session, url, semaphore)
-                chunk_tasks.append(task)
-            
-            # 執行並等待這一批完成
-            batch_results = await asyncio.gather(*chunk_tasks)
-            
-            # --- 🚀 即時檢查這一批的結果 ---
-            for res in batch_results:
-                if res['code'] == 410:
-                    error_count_410 += 1
-                    # 在專屬區域顯示錯誤
-                    with error_container:
-                        # 使用 columns 讓排版整齊：左邊文字，右邊(嘗試顯示)圖片
-                        c1, c2 = st.columns([3, 1])
-                        c1.error(f"#{error_count_410} | 🏚️ 410 Gone: {res['url']}")
-                        if show_broken_img:
-                            # 嘗試渲染圖片，讓使用者看到「破圖」圖示
-                            c2.image(res['url'], caption="預覽", width=100, output_format="JPEG")
-            
-            results.extend(batch_results)
-            
-            # 更新進度
-            current_count = min(i + chunk_size, total)
-            percent = current_count / total
-            progress_bar.progress(percent)
-            status_text.text(f"🛡️ 掃描中 ({current_count}/{total})... 發現 {error_count_410} 個 410 錯誤")
-            
-            # 呼吸時間
-            if i + chunk_size < total:
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-            
-        return results
+    // 2. 邏輯判斷：URL 唔係空，而且 Status 係空，先至去 Check
+    if (url !== "" && (currentStatus === "" || currentStatus === null)) {
+      
+      // 確保 url 係字串並移除前後空格
+      var cleanUrl = url.toString().trim();
+      
+      var result = checkUrl(cleanUrl); // 呼叫檢查函數
+      
+      statusCell.setValue(result); // 寫入結果
+      
+      // 🔥 強制刷新畫面 (即時顯示)
+      SpreadsheetApp.flush(); 
+    }
 
-def extract_url(json_str):
-    try:
-        data = json.loads(json_str)
-        return data.get('entries', {}).get('url')
-    except:
-        return None
+    // 更新進度
+    props.setProperty('LAST_ROW', i + 1);
+  }
 
-# --- UI 介面 ---
-tab1, tab2 = st.tabs(["📂 批量 CSV 檢查", "🔍 單一網址測試"])
+  stopTrigger();
+  props.deleteProperty('LAST_ROW');
+  SpreadsheetApp.getActiveSpreadsheet().toast('🎉 全部完成！');
+}
 
-# === Tab 1: 批量檢查 ===
-with tab1:
-    st.header("上傳 CSV 檢查 (含即時監控)")
+// ==========================================
+// 3️⃣ 網址檢查功能
+// ==========================================
+
+/**
+ * 檢查單一網址狀態 (無須 JSON parse，直接當網址用)
+ */
+function checkUrl(url) {
+  // 基本格式檢查
+  if (!url || !url.startsWith('http')) return "⚠️ 無效網址";
+  
+  try {
+    // 策略：使用 GET Range (只下載前 10 bytes) 
+    // 這是最快且最不容易被 Block 的方法
+    var options = {
+      'method': 'get', 
+      'headers': {
+        'Range': 'bytes=0-10', 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      },
+      'muteHttpExceptions': true,       
+      'followRedirects': true,          
+      'validateHttpsCertificates': false 
+    };
     
-    col_a, col_b = st.columns(2)
-    with col_a:
-        concurrency = st.slider("同時連線數 (Batch Size)", 10, 100, 30)
-    with col_b:
-        # 新增開關：是否要顯示 410 的破圖
-        show_broken_img = st.checkbox("即時顯示 410 圖片預覽 (會顯示破圖圖示)", value=True)
+    var response = UrlFetchApp.fetch(url, options);
+    var code = response.getResponseCode();
     
-    uploaded_file = st.file_uploader("選擇您的 CSV 檔案", type=["csv"], key="smart_check_uploader")
-
-    if uploaded_file is not None:
-        try:
-            df = pd.read_csv(uploaded_file)
-            if 'mainImage' in df.columns:
-                with st.spinner("正在解析 JSON 網址..."):
-                    df['extracted_url'] = df['mainImage'].apply(extract_url)
-                    unique_urls = df['extracted_url'].dropna().unique().tolist()
-                
-                st.info(f"📊 準備檢查 {len(unique_urls)} 個網址。")
-
-                # 建立一個空的容器，專門用來放即時錯誤
-                st.markdown("### 🚨 即時 410 錯誤監控 (Real-time Monitor)")
-                error_container = st.container()
-                
-                # 給容器一個固定高度的 Scroll (透過 CSS hack 可選，暫時保持預設)
-                # 這裡會隨著錯誤增加而變長
-
-                if st.button("🚀 開始掃描"):
-                    # 清空之前的錯誤顯示 (Streamlit 重新執行會自動清空，但如果是連續按鈕操作則需注意)
-                    
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    start_time = time.time()
-
-                    # 執行 AsyncIO，並傳入 container
-                    results = asyncio.run(process_batch_smart(
-                        unique_urls, 
-                        concurrency, 
-                        progress_bar, 
-                        status_text, 
-                        error_container,
-                        show_broken_img
-                    ))
-                    
-                    duration = time.time() - start_time
-                    progress_bar.progress(1.0)
-                    status_text.text(f"✅ 完成！")
-                    st.success(f"🎉 檢查完畢！耗時: {duration:.2f} 秒")
-
-                    results_df = pd.DataFrame(results)
-                    
-                    # 統計看板
-                    st.divider()
-                    c1, c2, c3, c4, c5 = st.columns(5)
-                    c1.metric("🟢 200 正常", len(results_df[results_df['code'] == 200]))
-                    c2.metric("🔴 404 失效", len(results_df[results_df['code'] == 404]))
-                    c3.metric("🏚️ 410 移除", len(results_df[results_df['code'] == 410]))
-                    c4.metric("🔥 504/Timeout", len(results_df[results_df['code'].isin([504, 408])]))
-                    c5.metric("❌ 其他", len(results_df[~results_df['code'].isin([200, 404, 410, 504, 408])]))
-
-                    st.subheader("詳細結果列表")
-                    all_statuses = sorted(results_df['status'].unique())
-                    filter_option = st.multiselect("過濾狀態碼:", options=all_statuses, default=all_statuses)
-                    
-                    filtered_df = results_df[results_df['status'].isin(filter_option)]
-                    st.dataframe(
-                        filtered_df, 
-                        column_config={
-                            "url": st.column_config.LinkColumn("圖片網址"),
-                            "status": "狀態",
-                            "reason": "伺服器訊息"
-                        },
-                        use_container_width=True
-                    )
-                    
-                    csv = results_df.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 下載完整報告", data=csv, file_name="http_status_report.csv", mime="text/csv")
-            else:
-                st.error("CSV 缺少 'mainImage' 欄位！")
-        except Exception as e:
-            st.error(f"錯誤: {e}")
-
-# === Tab 2: 單一檢查 ===
-with tab2:
-    st.header("單一網址 HTTP 測試")
-    url_input = st.text_input("輸入圖片網址", placeholder="https://...")
+    // 🛑 緩衝 (避免太快被封 IP)
+    Utilities.sleep(50); 
     
-    if st.button("檢查狀態"):
-        if url_input:
-            async def run_single():
-                semaphore = asyncio.Semaphore(1)
-                async with aiohttp.ClientSession() as session:
-                    return await check_http_status(session, url_input, semaphore)
-            
-            res = asyncio.run(run_single())
-            
-            if res['code'] == 200:
-                st.success(f"狀態: {res['status']}")
-                st.image(url_input, width=300, caption="圖片預覽")
-            elif res['code'] == 404:
-                st.error(f"狀態: {res['status']}")
-                st.warning("這張圖片已經不存在伺服器上 (Not Found)。")
-            elif res['code'] == 410:
-                st.error(f"狀態: {res['status']}")
-                st.warning("這張圖片已被永久移除 (Gone)。")
-                # 單一檢查也嘗試顯示，以證明它破圖
-                st.image(url_input, width=300, caption="嘗試載入(應為破圖)")
-            else:
-                st.warning(f"狀態: {res['status']} | 訊息: {res['reason']}")
+    // --- 狀態碼對應表 ---
+    if (code === 200 || code === 206) return "🟢 200"; // 206 = Partial Content (成功)
+    if (code === 404) return "🔴 404";
+    if (code === 410) return "🏚️ 410";
+    if (code === 403) return "🟠 403";
+    if (code === 429) return "⏳ 429";
+    if (code >= 500) return "🔥 " + code;
+    
+    return "⚠️ " + code;
+    
+  } catch (e) {
+    var msg = e.message;
+    if (msg.includes("Address unavailable") || msg.includes("DNS")) return "❌ DNS Error";
+    if (msg.includes("Timeout")) return "⏱️ Timeout";
+    return "❌ " + msg;
+  }
+}
+
+// ==========================================
+// 4️⃣ 自動化觸發器
+// ==========================================
+
+function createTrigger() {
+  stopTrigger();
+  ScriptApp.newTrigger('startRowByRowScanning')
+    .timeBased()
+    .after(60 * 1000)
+    .create();
+}
