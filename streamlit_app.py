@@ -9,12 +9,11 @@ import random
 # 設定頁面資訊
 st.set_page_config(page_title="HTTP Status Checker Pro", layout="wide", page_icon="🛡️")
 
-st.title("🛡️ 圖片 HTTP 狀態檢查工具 (抗封鎖版)")
+st.title("🛡️ 圖片 HTTP 狀態檢查工具 (即時 410 監控版)")
 st.markdown("""
-此版本針對 **大量 URL** 進行了優化：
-1. **偽裝瀏覽器** (User-Agent) 避免被識別為機器人。
-2. **自動重試** (當遇到 504/429 錯誤時會自動重試)。
-3. **分批處理** (每批次中間會有緩衝時間，避免被防火牆封鎖 IP)。
+此版本包含 **410 即時監控功能**：
+* 當系統偵測到 **410 Gone** 時，會立刻在下方顯示該連結。
+* 系統會嘗試顯示該圖片（因為已移除，您應該會看到「破圖」圖示）。
 """)
 
 # --- 偽裝 Header ---
@@ -29,9 +28,9 @@ async def check_http_status(session, url, semaphore):
     if not url or not isinstance(url, str) or not url.startswith('http'):
         return {"url": url, "code": 0, "status": "⚠️ Invalid URL", "reason": "Malformed URL"}
     
-    # 限制同時執行數量 (Semaphore)
+    # 限制同時執行數量
     async with semaphore:
-        retries = 3 # 設定重試次數
+        retries = 3
         for attempt in range(retries):
             try:
                 # 使用 HEAD 請求
@@ -39,9 +38,8 @@ async def check_http_status(session, url, semaphore):
                     code = response.status
                     reason = response.reason
                     
-                    # 如果遇到 504 (Timeout) 或 429 (Too Many Requests)，且不是最後一次嘗試 -> 等待後重試
                     if code in [504, 429, 503] and attempt < retries - 1:
-                        wait_time = (attempt + 1) * 2 # 等待 2秒, 4秒...
+                        wait_time = (attempt + 1) * 2
                         await asyncio.sleep(wait_time)
                         continue 
 
@@ -67,7 +65,6 @@ async def check_http_status(session, url, semaphore):
                     }
             
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-                # 網路錯誤也重試
                 if attempt < retries - 1:
                     await asyncio.sleep(2)
                     continue
@@ -75,46 +72,54 @@ async def check_http_status(session, url, semaphore):
             except Exception as e:
                 return {"url": url, "code": 0, "status": "❌ Error", "reason": str(e)}
 
-async def process_batch_smart(urls, max_concurrency, progress_bar, status_text):
-    """智能分批處理，防止被封鎖"""
+async def process_batch_smart(urls, max_concurrency, progress_bar, status_text, error_container, show_broken_img):
+    """智能分批處理，並即時回報 410"""
     
-    # 限制同時連線數 (Semaphore 是更嚴格的控制)
     semaphore = asyncio.Semaphore(max_concurrency)
-    
-    # TCP Connector 設定
     connector = aiohttp.TCPConnector(limit=max_concurrency, ssl=False)
-    
     timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=10)
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        tasks = []
         results = []
         total = len(urls)
-        
-        # 將 URL 分成小塊 (Chunks)，例如每 50 個一組
         chunk_size = 50 
+        
+        # 用來計算即時錯誤數量
+        error_count_410 = 0
         
         for i in range(0, total, chunk_size):
             chunk_urls = urls[i : i + chunk_size]
             chunk_tasks = []
             
-            # 建立這一批的任務
             for url in chunk_urls:
                 task = check_http_status(session, url, semaphore)
                 chunk_tasks.append(task)
             
-            # 執行這一批
+            # 執行並等待這一批完成
             batch_results = await asyncio.gather(*chunk_tasks)
+            
+            # --- 🚀 即時檢查這一批的結果 ---
+            for res in batch_results:
+                if res['code'] == 410:
+                    error_count_410 += 1
+                    # 在專屬區域顯示錯誤
+                    with error_container:
+                        # 使用 columns 讓排版整齊：左邊文字，右邊(嘗試顯示)圖片
+                        c1, c2 = st.columns([3, 1])
+                        c1.error(f"#{error_count_410} | 🏚️ 410 Gone: {res['url']}")
+                        if show_broken_img:
+                            # 嘗試渲染圖片，讓使用者看到「破圖」圖示
+                            c2.image(res['url'], caption="預覽", width=100, output_format="JPEG")
+            
             results.extend(batch_results)
             
             # 更新進度
             current_count = min(i + chunk_size, total)
             percent = current_count / total
             progress_bar.progress(percent)
-            status_text.text(f"🛡️ 掃描中 (已完成 {current_count}/{total})... 休息防封鎖中 ☕")
+            status_text.text(f"🛡️ 掃描中 ({current_count}/{total})... 發現 {error_count_410} 個 410 錯誤")
             
-            # 關鍵：每一批做完後，稍微休息一下 (0.5 ~ 1.5 秒隨機)
-            # 這能大幅減少 504 出現的機率
+            # 呼吸時間
             if i + chunk_size < total:
                 await asyncio.sleep(random.uniform(0.5, 1.5))
             
@@ -132,11 +137,14 @@ tab1, tab2 = st.tabs(["📂 批量 CSV 檢查", "🔍 單一網址測試"])
 
 # === Tab 1: 批量檢查 ===
 with tab1:
-    st.header("上傳 CSV 檢查 (安全模式)")
+    st.header("上傳 CSV 檢查 (含即時監控)")
     
-    with st.expander("⚙️ 設定與效能", expanded=True):
-        st.caption("如果仍然出現大量 504，請嘗試調低此數值")
-        concurrency = st.slider("同時連線數 (建議 20-50)", 10, 100, 30)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        concurrency = st.slider("同時連線數 (Batch Size)", 10, 100, 30)
+    with col_b:
+        # 新增開關：是否要顯示 410 的破圖
+        show_broken_img = st.checkbox("即時顯示 410 圖片預覽 (會顯示破圖圖示)", value=True)
     
     uploaded_file = st.file_uploader("選擇您的 CSV 檔案", type=["csv"], key="smart_check_uploader")
 
@@ -148,15 +156,31 @@ with tab1:
                     df['extracted_url'] = df['mainImage'].apply(extract_url)
                     unique_urls = df['extracted_url'].dropna().unique().tolist()
                 
-                st.info(f"📊 準備檢查 {len(unique_urls)} 個網址。系統將自動分批處理以避免 504 錯誤。")
+                st.info(f"📊 準備檢查 {len(unique_urls)} 個網址。")
 
-                if st.button("🚀 開始安全掃描"):
+                # 建立一個空的容器，專門用來放即時錯誤
+                st.markdown("### 🚨 即時 410 錯誤監控 (Real-time Monitor)")
+                error_container = st.container()
+                
+                # 給容器一個固定高度的 Scroll (透過 CSS hack 可選，暫時保持預設)
+                # 這裡會隨著錯誤增加而變長
+
+                if st.button("🚀 開始掃描"):
+                    # 清空之前的錯誤顯示 (Streamlit 重新執行會自動清空，但如果是連續按鈕操作則需注意)
+                    
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     start_time = time.time()
 
-                    # 執行智能批次處理
-                    results = asyncio.run(process_batch_smart(unique_urls, concurrency, progress_bar, status_text))
+                    # 執行 AsyncIO，並傳入 container
+                    results = asyncio.run(process_batch_smart(
+                        unique_urls, 
+                        concurrency, 
+                        progress_bar, 
+                        status_text, 
+                        error_container,
+                        show_broken_img
+                    ))
                     
                     duration = time.time() - start_time
                     progress_bar.progress(1.0)
@@ -166,6 +190,7 @@ with tab1:
                     results_df = pd.DataFrame(results)
                     
                     # 統計看板
+                    st.divider()
                     c1, c2, c3, c4, c5 = st.columns(5)
                     c1.metric("🟢 200 正常", len(results_df[results_df['code'] == 200]))
                     c2.metric("🔴 404 失效", len(results_df[results_df['code'] == 404]))
@@ -173,10 +198,7 @@ with tab1:
                     c4.metric("🔥 504/Timeout", len(results_df[results_df['code'].isin([504, 408])]))
                     c5.metric("❌ 其他", len(results_df[~results_df['code'].isin([200, 404, 410, 504, 408])]))
 
-                    if len(results_df[results_df['code'] == 504]) > 0:
-                        st.warning("⚠️ 偵測到 504 Gateway Timeout。這表示伺服器忙碌或封鎖請求。請嘗試調低「同時連線數」再試一次。")
-
-                    st.subheader("詳細結果")
+                    st.subheader("詳細結果列表")
                     all_statuses = sorted(results_df['status'].unique())
                     filter_option = st.multiselect("過濾狀態碼:", options=all_statuses, default=all_statuses)
                     
@@ -206,7 +228,7 @@ with tab2:
     if st.button("檢查狀態"):
         if url_input:
             async def run_single():
-                semaphore = asyncio.Semaphore(1) # 單一檢查不需要限制
+                semaphore = asyncio.Semaphore(1)
                 async with aiohttp.ClientSession() as session:
                     return await check_http_status(session, url_input, semaphore)
             
@@ -221,5 +243,7 @@ with tab2:
             elif res['code'] == 410:
                 st.error(f"狀態: {res['status']}")
                 st.warning("這張圖片已被永久移除 (Gone)。")
+                # 單一檢查也嘗試顯示，以證明它破圖
+                st.image(url_input, width=300, caption="嘗試載入(應為破圖)")
             else:
                 st.warning(f"狀態: {res['status']} | 訊息: {res['reason']}")
